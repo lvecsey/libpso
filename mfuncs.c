@@ -88,3 +88,23 @@ point3d_t math3d_ripple(double x, double y) {
   return pnta;
 
 }
+
+double sgn(double x) {
+
+  if (x < 0.0) {
+    return -1.0;
+  }
+
+  return 1.0;
+
+}
+
+point3d_t math3d_stairs(double x, double y) {
+
+  point3d_t pnta;
+
+  pnta = (point3d_t) { .x = x, .y = y, .z = (sgn(-0.65 - x) + sgn(-0.35 - x) + sgn(-0.05 - x) + sgn(0.25 - x) + sgn (0.55 - x)) / 0.7 };
+  
+  return pnta;
+
+}

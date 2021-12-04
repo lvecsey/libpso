@@ -7,6 +7,8 @@
 
 #include "particlepack.h"
 
-int update_rangepso(particlepack *pp, pthread_mutex_t *bestparticle_mutex, double percent, int rnd_fd, long int particle_start, long int particle_end, double (*fitness_func)(point3d_t *pnta, void *extra), void *ff_extra, double blo, double bup);
+#include "bestpack.h"
+
+int update_rangepso(particlepack *pp, pthread_mutex_t *globalbest_mutex, double percent, int rnd_fd, long int particle_start, long int particle_end, double (*fitness_func)(point3d_t *pnta, void *extra), void *ff_extra, double blo, double bup, bestpack *tp_gbest);
 
 #endif

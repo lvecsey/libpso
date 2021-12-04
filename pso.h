@@ -57,25 +57,29 @@ typedef struct {
 
 typedef struct {
 
-  long int *wpstatus;
+  volatile long int *wpstatus;
   
 } workpack_markstatus;
 
 typedef struct {
 
-  long int generationno;
+  volatile long int generationno;
 
+  volatile uint64_t gencompleted_counter;
+  
   long int workid;
   
-  uint64_t *thread_states;
+  volatile uint64_t *thread_states;
 
 } psorw;
 
-enum { MQUEUE, MERRCALC, MPARTICLE, MPACK, MEXTRAPAR, MBESTPARTICLE, MGENERATION, MTHREADSTATE };
+enum { MQUEUE, MERRCALC, MPARTICLE, MPACK, MEXTRAPAR, MGLOBALBEST, MGENERATION, MTHREADSTATE };
 
 #define num_mutex 8
 
 enum { PSO_INIT, PSO_PROCESSING, PSO_COMPLETE };
+
+enum { PSO_ALL, PSO_STEP };
 
 typedef struct {
 
@@ -97,9 +101,6 @@ typedef struct {
 
   pthread_mutex_t *mutex;
     
-  pthread_cond_t worker_calccond;
-  pthread_mutex_t *worker_calc;
-
   pthread_cond_t mainproc_cond;
   pthread_mutex_t mainproc_mutex;
 
@@ -117,7 +118,12 @@ typedef struct {
   struct timespec start;
 
   psorw prw;
+
+  long int packs_region[2];
+  long int max_generations;
   
+  long int debug_level;
+
 } pso;
 
 #include "mini_gxkit.h"
@@ -132,13 +138,17 @@ int alloc_ppack(particlepack *pp, long int num_particles);
 
 int alloc_threadprogress(generation_results *gr, long int num_generations);
 
-workpack_markstatus alloc_wpstatus(long int num_packs);
+int alloc_wpstatus(workpack_markstatus *wp, long int num_packs);
+
+update_param tuning_param(double accel_c, double c1, double c2);
+
+int setfull_computation(long int *packs_region, long int workpacks_pergeneration);
 
 int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), void *ff_extra);
 
 int show_pso(pso *ps);
 
-int output_asc(pso *ps, char *filename);
+int output_asc(particlepack *pp, long int num_particles, char *filename);
 
 int output_geomview(pso *ps, FILE *fp_out);
 

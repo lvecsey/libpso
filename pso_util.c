@@ -31,7 +31,7 @@ double calc_single(point3d_t *cmp_pnt1, point3d_t *cmp_pnt2) {
   diff[1] = (cmp_pnt1->y - cmp_pnt2->y);
   diff[2] = (cmp_pnt1->z - cmp_pnt2->z);      
 
-  err = (diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]);
+  err = sqrt(diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]);
 
   return err;
   

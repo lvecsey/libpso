@@ -23,10 +23,12 @@
 
 #include "mini_gxkit.h"
 
+#include "fitnesspack.h"
+
 typedef struct {
 
   double accel_c;
-  double rand1, rand2;
+  double c1, c2;
   
 } update_param;
 
@@ -35,17 +37,15 @@ typedef struct {
   vec3d *vcur;
   point3d_t *xcur;
 
-  double *fitness;
   point3d_t *pbest;
+  double *fitness;
 
   point3d_t gbest;
   double gbesterr;
   
   update_param up;
 
-  double (*fitness_func)(point3d_t *pnta, void *ff_extra);
-
-  void *ff_extra;
+  fitnesspack fpack;
   
 } particlepack;
 

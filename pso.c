@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include <assert.h>
+
 #include <stdint.h>
 
 #include <pthread.h>
@@ -50,13 +52,18 @@
 
 #include "update_range.h"
 
-#define debugprint fprintf
+#include "workitems.h"
 
+#include "fitnesspack.h"
+
+#undef debugprint
+
+#ifdef debugprint
+#define dfprintf fprintf
+#else
 #define emptyprint(fp, str, ...) ;
-
 #define dfprintf emptyprint
-
-const long int debug_level = 1;
+#endif
 
 const long int def_numpart = 250000;
 
@@ -64,9 +71,9 @@ const long int def_numgenerations = 4000;
 
 TAILQ_HEAD(tailhead, entry) head = TAILQ_HEAD_INITIALIZER(head);
 
-int generate_work(pso *ps, long int num_workpacks, long int generationno);
+int generate_work(pso *ps, long int num_workpacks, long int generationno, long int *pack_region);
 workunit gen_workcalc(psorw *prw);
-int show_threads(uint64_t *thread_states, long int num_threads);
+int show_threads(volatile uint64_t *thread_states, long int num_threads);
 
 int show_work(workunit *work);
 
@@ -74,6 +81,8 @@ double elap_cur(struct timespec *start, extraparams *ep);
 
 int clear_wpstatus(workpack_markstatus *wp, long int num_packs);
 int show_wpstatus(workpack_markstatus *wp, long int num_packs);
+
+int process_calcwork(pso *ps, extraparams *ep, fitnesspack *fpack, workunit *work);
 
 int init_pso(pso *ps, long int num_threads) {
 
@@ -103,40 +112,6 @@ int init_pso(pso *ps, long int num_threads) {
 
   }
       
-  retval = pthread_cond_init(&(ps->worker_calccond), NULL);
-  if (retval == -1) {
-    perror("pthread_cond_init");
-    return -1;
-  }
-
-  ps->worker_calc = malloc(sizeof(pthread_mutex_t) * num_threads);
-  if (ps->worker_calc == NULL) {
-    perror("malloc");
-    return -1;
-  }
-
-  for (threadno = 0; threadno < num_threads; threadno++) {  
-
-    retval = pthread_mutex_init(ps->worker_calc + threadno, NULL);
-    if (retval == -1) {
-      perror("pthread_mutex_init");
-      return -1;
-    }
-
-  }
-  
-  retval = pthread_cond_init(&(ps->mainproc_cond), NULL);
-  if (retval == -1) {
-    perror("pthread_cond_init");
-    return -1;
-  }
-
-  retval = pthread_mutex_init(&(ps->mainproc_mutex), NULL);
-  if (retval == -1) {
-    perror("pthread_mutex_init");
-    return -1;
-  }
-
   retval = pthread_cond_init(&(ps->worker_advancecond), NULL);
   if (retval == -1) {
     perror("pthread_cond_init");
@@ -162,6 +137,8 @@ int init_pso(pso *ps, long int num_threads) {
   ps->workpacks_pergeneration = (pso_workpacks * num_threads);
   
   ps->prw.generationno = 0;
+
+  ps->prw.gencompleted_counter = 0;
   
   ps->prw.workid = 0;
 
@@ -219,23 +196,25 @@ int alloc_threadprogress(generation_results *gr, long int num_generations) {
   
 }
 
-workpack_markstatus alloc_wpstatus(long int num_packs) {
+int alloc_wpstatus(workpack_markstatus *wp, long int num_packs) {
 
-  workpack_markstatus wp;
-
-  wp.wpstatus = malloc(sizeof(long int) * num_packs);
-  if (wp.wpstatus == NULL) {
+  wp->wpstatus = malloc(sizeof(long int) * num_packs);
+  if (wp->wpstatus == NULL) {
     perror("malloc");
-    exit(EXIT_FAILURE);
+    return -1;
   }
   
-  return wp;
+  return 0;
 
 }
 
 int clear_wpstatus(workpack_markstatus *wp, long int num_packs) {
-  
-  memset(wp->wpstatus, 0, sizeof(long int) * num_packs);
+
+  long int packno;
+
+  for (packno = 0; packno < num_packs; packno++) {
+    wp->wpstatus[packno] = 0;
+  }
 
   return 0;
   
@@ -269,7 +248,7 @@ point3d_t assign_pnt(point3d_t *a, point3d_t *b, point3d_t *c) {
   
 }
 
-int output_asc(pso *ps, char *filename) {
+int output_asc(particlepack *pp, long int num_particles, char *filename) {
   
   int asc_fd;
   mode_t mode;
@@ -282,15 +261,11 @@ int output_asc(pso *ps, char *filename) {
 
   long int particleno;
 
-  particlepack *pp;
-
   point3d_t *particles;
 
   int retval;
 
   point3d_t pnta;
-  
-  pp = &(ps->pp);
   
   fprintf(stderr, "%s: Output final vertex points %s\n", __FUNCTION__, filename);
     
@@ -299,7 +274,7 @@ int output_asc(pso *ps, char *filename) {
 
   particles = pp->pbest;
   
-  for (particleno = 0; particleno < ps->num_particles; particleno++) {
+  for (particleno = 0; particleno < num_particles; particleno++) {
 
     pnta  = particles[particleno];
     
@@ -383,7 +358,11 @@ int fill_initialrnd(particlepack *pp, long int num_particles, int rnd_fd, double
 
   double span;
 
+  double fa;
+  
   span = (bup - blo);
+
+  fa = fabs(bup - blo);
   
   for (particleno = 0; particleno < num_particles; particleno++) {
 
@@ -393,13 +372,13 @@ int fill_initialrnd(particlepack *pp, long int num_particles, int rnd_fd, double
       return -1;
     }
     
-    pp->vcur[particleno][0] = -span + (2.0 * span * rnds[0]) / 18446744073709551615.0;
-    pp->vcur[particleno][1] = -span + (2.0 * span * rnds[1]) / 18446744073709551615.0;
-    pp->vcur[particleno][2] = -span + (2.0 * span * rnds[2]) / 18446744073709551615.0;    
+    pp->xcur[particleno].x = blo + (2.0 * span * rnds[0]) / 18446744073709551615.0;
+    pp->xcur[particleno].y = blo + (2.0 * span * rnds[1]) / 18446744073709551615.0;
+    pp->xcur[particleno].z = blo + (2.0 * span * rnds[2]) / 18446744073709551615.0;    
     
-    pp->xcur[particleno].x = blo + (span * rnds[3]) / 18446744073709551615.0;
-    pp->xcur[particleno].y = blo + (span * rnds[4]) / 18446744073709551615.0;
-    pp->xcur[particleno].z = blo + (span * rnds[5]) / 18446744073709551615.0;    
+    pp->vcur[particleno][0] = -fa + (2.0 * fa * rnds[3]) / 18446744073709551615.0;
+    pp->vcur[particleno][1] = -fa + (2.0 * fa * rnds[4]) / 18446744073709551615.0;
+    pp->vcur[particleno][2] = -fa + (2.0 * fa * rnds[5]) / 18446744073709551615.0;    
     
   }
   
@@ -411,10 +390,11 @@ int fill_initialrnd(particlepack *pp, long int num_particles, int rnd_fd, double
 #define HAVEWORK 0x2
 #define EMPTYQUEUE 0x4
 #define WAITCOND_NEXTGEN 0x8
+#define WAITCOND_FAIL 0x10
 
 typedef struct {
 
-  uint64_t *state;
+  volatile uint64_t *state;
 
   pso *ps;
 
@@ -434,9 +414,11 @@ typedef struct {
   
   extraparams *ep;
 
-  uint64_t *thread_states;
+  bestpack tp_gbest;
+  
+  volatile uint64_t *thread_states;
 
-  long int *generationno;
+  volatile long int *generationno;
 
 } threadpack;
 
@@ -510,7 +492,7 @@ int postwork_progress(pso *ps, double totalerr, long int generationno, struct ti
 	
     percent = generationno; percent /= ps->num_generations;
 
-    {
+    if (ps->progress_func != NULL) {
 
       double elapsed_sec;
 
@@ -520,17 +502,17 @@ int postwork_progress(pso *ps, double totalerr, long int generationno, struct ti
 	  
       remaining_sec = (estimated_totalsec - elapsed_sec);
 
-    }
-       
-    ps->progress_func(percent, remaining_sec, generationno, totalerr);
+      ps->progress_func(percent, remaining_sec, generationno, totalerr);
 
+    }
+      
   }
             
   return 0;
 
 }
 
-int advance_generation(pso *ps, particlepack *pp, long int workpacks_pergeneration) {
+int advance_generation(pso *ps, particlepack *pp, long int workpacks_pergeneration, long int *pack_region) {
 
   int retval;
 
@@ -539,9 +521,9 @@ int advance_generation(pso *ps, particlepack *pp, long int workpacks_pergenerati
   pthread_mutex_unlock(ps->mutex + MGENERATION);
 
   pthread_mutex_lock(ps->mutex + MGENERATION);  
-  retval = generate_work(ps, workpacks_pergeneration, ps->prw.generationno);
+  retval = generate_work(ps, workpacks_pergeneration, ps->prw.generationno, pack_region);
   if (retval == -1) {
-    printf("%s: Trouble with call to generate_work.\n", __FUNCTION__);
+    fprintf(stderr, "%s: Trouble with call to generate_work.\n", __FUNCTION__);
     return -1;
   }
   pthread_mutex_unlock(ps->mutex + MGENERATION);
@@ -550,7 +532,7 @@ int advance_generation(pso *ps, particlepack *pp, long int workpacks_pergenerati
 
 }
 
-int shutdown_threads(uint64_t *thread_states, long int num_threads) {
+int shutdown_threads(volatile uint64_t *thread_states, long int num_threads) {
 
   long int threadno;
 
@@ -570,19 +552,23 @@ int process_regwork(pso *ps, threadpack *tp, workunit *work) {
 
   pp = &(ps->pp);
 
-  dfprintf(stderr, "%s: Processing work item %ld for generationno %ld\n", __FUNCTION__, work->packno, work->generationno);
+  dfprintf(stderr, "%s: Processing work item %ld for generationno %ld/%ld\n", __FUNCTION__, work->packno, work->generationno, ps->num_generations);
     
   {
     
     percent = work->generationno; percent /= ps->num_generations;
 
-    update_rangepso(pp, ps->mutex + MBESTPARTICLE, percent, tp->rnd_fd, work->particle_start, work->particle_end, tp->fitness_func, tp->ff_extra, ps->blo, ps->bup);
+    update_rangepso(pp, ps->mutex + MGLOBALBEST, percent, tp->rnd_fd, work->particle_start, work->particle_end, tp->fitness_func, tp->ff_extra, ps->blo, ps->bup, &(tp->tp_gbest));
 
+    if (work->packno < 0 || work->packno >= ps->workpacks_pergeneration) {
+      fprintf(stderr, "%s: Warning work->packno %ld out of range\n", __FUNCTION__, work->packno);
+    }
+    
     pthread_mutex_lock(ps->mutex + MPACK);
     ps->wp.wpstatus[ work->packno ] |= 1;
     pthread_mutex_unlock(ps->mutex + MPACK);
 
-    if (debug_level > 1) {
+    if (ps->debug_level > 1) {
       dfprintf(stderr, "%s: Working on range %ld through %ld\n", __FUNCTION__, work->particle_start, work->particle_end);
     }
       
@@ -592,26 +578,22 @@ int process_regwork(pso *ps, threadpack *tp, workunit *work) {
 
 }
 
-int process_calcwork(pso *ps, threadpack *tp, workunit *work) {
+int process_calcwork(pso *ps, extraparams *ep, fitnesspack *fpack, workunit *work) {
 
   double totalerr;
   
   particlepack *pp;
 
-  extraparams *ep;
-  
   int retval;
   
   pp = &(ps->pp);
 
-  ep = tp->ep;
-
-  dfprintf(stderr, "%s: Processing work item %ld for generationno %ld\n", __FUNCTION__, work->packno, work->generationno);
+  dfprintf(stderr, "%s: Processing calculate work item for generationno %ld\n", __FUNCTION__, work->generationno);
   
   {
 
     pthread_mutex_lock(ps->mutex + MPARTICLE);
-    totalerr = calc_totalerror(pp->pbest, ps->num_particles, tp->fitness_func, tp->ff_extra);
+    totalerr = calc_totalerror(pp->pbest, ps->num_particles, fpack->fitness_func, fpack->ff_extra);
     pthread_mutex_unlock(ps->mutex + MPARTICLE);    
 
     if (isnan(totalerr)) {
@@ -652,19 +634,21 @@ int process_calcwork(pso *ps, threadpack *tp, workunit *work) {
 	
     }
 
+    retval = 0;
+    
     pthread_mutex_lock(ps->mutex + MERRCALC);
-    if ( (!(work->generationno % ep->progressdisp_freq)) && (ps->progress_func != NULL)) {
+    if (!(work->generationno % ep->progressdisp_freq)) {
       retval = postwork_progress(ps, totalerr, work->generationno, &(ep->then), &(ep->now), &(ep->progressdisp_freq));
     }
     pthread_mutex_unlock(ps->mutex + MERRCALC);
     
     if (retval == -1) {
-      dfprintf(stderr, "%s[%ld]: Leaving due to failure with postwork_progress.\n", __FUNCTION__, tp->threadno);
+      dfprintf(stderr, "%s: Leaving due to failure with postwork_progress.\n", __FUNCTION__, tp->threadno);
       return -1;
     }
 
     if (retval == 1) {
-      printf("%s[%ld]: Early completion.\n", __FUNCTION__, tp->threadno);
+      fprintf(stderr, "%s: Early completion.\n", __FUNCTION__);
       return 0;
       
     }
@@ -674,7 +658,27 @@ int process_calcwork(pso *ps, threadpack *tp, workunit *work) {
   return 0;
 
 }
+
+int show_works(workunit *works, long int num_works) {
+
+  long int workno;
+
+  fprintf(stderr, "%s: Works ", __FUNCTION__);
   
+  for (workno = 0; workno < num_works; workno++) {
+
+    fprintf(stderr, "%ld ", works[workno].packno);
+    
+  }
+
+  fprintf(stderr, "\n");
+  
+  return 0;
+  
+}
+
+#define advancewrap_ptr(base_ptr, num_elements, ptr) ((ptr) < ((base_ptr) + num_elements - 1)) ? ((ptr) + 1) : (base_ptr);
+
 void *pso_routine(void *extra) {
 
   void *ret;
@@ -683,27 +687,23 @@ void *pso_routine(void *extra) {
 
   threadpack *tp;
 
-  struct entry *n2;
+  struct entry *n1, *n2;
 
-  workunit work;
-  
   int retval;
 
+  long int previous_generationno; 
+  
   uint64_t counter;
 
   workunit *works;
 
   long int num_works;
-
-  workunit *rwork_ptr;
-
-  workunit *ework_ptr;
-
-  long int previous_generationno;
   
-  uint64_t calcwait_counter;
+  workunit *rptr_work;
+  workunit *wptr_work;
+  workunit *eptr_work;
 
-  long int workno;
+  long int num_collect; 
   
   tp = (threadpack*) extra;
 
@@ -713,8 +713,9 @@ void *pso_routine(void *extra) {
 
   counter = 0;
 
-  num_works = 10;
+  num_works = 84;
 
+  n1 = NULL;
   n2 = NULL;
   
   works = malloc(sizeof(workunit) * num_works);
@@ -723,54 +724,87 @@ void *pso_routine(void *extra) {
     return ret;
   }
 
-  rwork_ptr = works + 0;
-  ework_ptr = works + 1;
-
   previous_generationno = -1;
 
-  calcwait_counter = 0;
+  num_collect = 28;
   
-  memset(&work, 0, sizeof(workunit));
-
+  rptr_work = (works + 0);
+  wptr_work = (works + 0);
+  eptr_work = (works + (num_collect + 1));
+  
+  memset(works, 0, num_works * sizeof(workunit));
+  
   while (tp->state[0] & RUNNING) {
 
     dfprintf(stderr, "%s[%ld](counter %lu) Thread work.\n", __FUNCTION__, tp->threadno, counter);
 
-    for (workno = 0; workno < num_works; workno++) {
-    
-      if (tp->state[0] & EMPTYQUEUE) {
-	break;
-      }
+    if (!(tp->state[0] & EMPTYQUEUE) && (tp->state[0] & RUNNING)) {
 
+      long int num_availentry;
+      
       dfprintf(stderr, "%s[%ld]: !EMPTYQUEUE\n", __FUNCTION__, tp->threadno);
 
-      workno = 0;
+      num_availentry = available_workitems(works, num_works, wptr_work, eptr_work);
+
+      dfprintf(stderr, "%s: EMPTYQUEUE Total work entries available to fill in our local processing buffer %ld\n", __FUNCTION__, num_availentry);
+      
+      if (num_availentry <= 0) {
+
+	dfprintf(stderr, "%s: rno %ld wno %ld eno %ld\n", __FUNCTION__, rptr_work - works, wptr_work - works, eptr_work - works);
+	
+	{
+
+	  long int extend;
+
+	  extend = (eptr_work - works) + num_collect;
+
+	  extend %= (num_works - 1);
+
+	  eptr_work = (works + extend);
+
+	  dfprintf(stderr, "%s: Setting eptr_work to %ld\n", __FUNCTION__, eptr_work - works);
+	
+	}
+	
+      }
       
       pthread_mutex_lock(ps->mutex + MQUEUE);
-      if (!TAILQ_EMPTY(ps->headp)) {
-	n2 = TAILQ_FIRST(ps->headp);
-	work = n2->work;
-	TAILQ_REMOVE(ps->headp, n2, entries);
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);
-	tp->state[0] |= HAVEWORK;
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
-      } else {
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);
-	tp->state[0] |= EMPTYQUEUE;
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
+
+      n1 = TAILQ_FIRST(ps->headp);
+      while (n1 != NULL && wptr_work != eptr_work) {
+
+	wptr_work[0] = n1->work;
+	
+	wptr_work = advancewrap_ptr(works, num_works, wptr_work)
+
+	n2 = TAILQ_NEXT(n1, entries);
+	TAILQ_REMOVE(ps->headp, n1, entries);
+	dfprintf(stderr, "%s: Removing n1 %p\n", __FUNCTION__, n1);
+	free(n1);
+	n1 = n2;
+	
       }
+
       pthread_mutex_unlock(ps->mutex + MQUEUE);
 
-      if ( (tp->state[0] & HAVEWORK) && (tp->state[0] & RUNNING) ) {
+      num_availentry = available_workitems(works, num_works, wptr_work, eptr_work);
 
-	dfprintf(stderr, "%s[%ld](%gs): HAVEWORK(%ld) %ld %ld for generation %ld\n", __FUNCTION__, tp->threadno, elap_cur(&(ps->start), tp->ep), work.packno, work.particle_start, work.particle_end, work.generationno);
+      dfprintf(stderr, "%s: EMPTYQUEUE Total work entries still available to fill in our local processing buffer %ld\n", __FUNCTION__, num_availentry);
+      
+      tp->state[0] |= (n1 == NULL) ? EMPTYQUEUE : HAVEWORK;
+
+    }
+
+    if ( (tp->state[0] & HAVEWORK) && (tp->state[0] & RUNNING)) {
+      
+      do {
+
+	dfprintf(stderr, "%s[%ld](%gs): HAVEWORK(%ld) %ld %ld for generation %ld\n", __FUNCTION__, tp->threadno, elap_cur(&(ps->start), tp->ep), rptr_work->packno, rptr_work->particle_start, rptr_work->particle_end, rptr_work->generationno);
+
+	dfprintf(stderr, "%s: Working on rptr_work %p which is offset %ld\n", __FUNCTION__, rptr_work, rptr_work - works);
 	
-	free(n2);      
-
-	retval = process_regwork(ps, tp, &work);
+	retval = process_regwork(ps, tp, rptr_work);
 	if (retval == -1) {
-
-	  fprintf(stderr, "%s[%ld]: Failure with call to process_regwork.\n", __FUNCTION__, tp->threadno);
 
 	  pthread_mutex_lock(ps->mutex + MTHREADSTATE);
 	  shutdown_threads(ps->prw.thread_states, ps->num_threads);
@@ -779,24 +813,24 @@ void *pso_routine(void *extra) {
 	  pthread_mutex_lock(ps->mutex + MTHREADSTATE);
 	  show_threads(ps->prw.thread_states, ps->num_threads);
 	  pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      
+
+	  tp->state[0] = 0;
 	  
 	  break;
 	  
 	}
 
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);
-	tp->state[0] &= (~HAVEWORK);
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
-	
-      }
+	rptr_work = advancewrap_ptr(works, num_works, rptr_work)
+
+      } while (rptr_work != wptr_work);
+
+      tp->state[0] &= (~HAVEWORK);
 
     }
 
     if ( (tp->state[0] & EMPTYQUEUE) && (tp->state[0] & RUNNING) ) {
 
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);
       tp->state[0] |= WAITCOND_NEXTGEN;
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
       
     }
 
@@ -810,8 +844,8 @@ void *pso_routine(void *extra) {
       if (previous_generationno >= (ps->num_generations - 1)) {
 
 	dfprintf(stderr, "%s[%ld](%gs): Thread has reached last generation, no longer advancing.\n", __FUNCTION__, tp->threadno, elap_cur(&(ps->start), tp->ep));	
-	
-	break;
+
+	tp->state[0] = 0;
 	
       }
       
@@ -822,30 +856,29 @@ void *pso_routine(void *extra) {
 	retval = pthread_cond_wait(&(ps->worker_advancecond), ps->worker_advance + tp->threadno);
 	if (retval == -1) {
 	  perror("pthread_cond_wait");
-	  free(works);
-	  return ret;
+	  tp->state[0] |= WAITCOND_FAIL;
 	}
 
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);
 	tp->state[0] &= ~(WAITCOND_NEXTGEN);
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
 	
       }
 
       pthread_mutex_unlock(ps->worker_advance + tp->threadno);
+
+      if (tp->state[0] & WAITCOND_FAIL) {
+	break;
+      }
       
       dfprintf(stderr, "%s[%ld](%gs): Received broadcast wakeup for next generation.\n", __FUNCTION__, tp->threadno, elap_cur(&(ps->start), tp->ep));
-
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);
+      
       tp->state[0] &= ~(EMPTYQUEUE);
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      
       
     }
-    
+
     counter++;
     
   }
-  
+
   free(works);
   
   dfprintf(stderr, "%s[%ld]: Leaving.\n", __FUNCTION__, tp->threadno);
@@ -854,9 +887,9 @@ void *pso_routine(void *extra) {
 
 }
 
-int generate_work(pso *ps, long int num_workpacks, long int generationno) {
+int generate_work(pso *ps, long int num_workpacks, long int generationno, long int *pack_region) {
 
-  long int varstart;
+  long int particle_start;
 
   long int particles_perpack;
 
@@ -866,7 +899,7 @@ int generate_work(pso *ps, long int num_workpacks, long int generationno) {
 
   particles_perpack = (ps->num_particles / num_workpacks);
   
-  for (packno = 0; packno < num_workpacks; packno++) {
+  for (packno = pack_region[0]; packno < pack_region[1]; packno++) {
       
     n1 = malloc(sizeof(struct entry));
     if (n1 == NULL) {
@@ -874,18 +907,14 @@ int generate_work(pso *ps, long int num_workpacks, long int generationno) {
       return -1;
     }
 
-    varstart = (packno * particles_perpack);
+    particle_start = (packno * particles_perpack);
     
-    n1->work = (workunit) { .workid = ps->prw.workid, .generationno = generationno, .packno = packno, .particle_start = varstart, .particle_end = (varstart + particles_perpack), .wtype = WPROCESS_RANGE };
+    n1->work = (workunit) { .workid = ps->prw.workid, .generationno = generationno, .packno = packno, .particle_start = particle_start, .particle_end = (particle_start + particles_perpack), .wtype = WPROCESS_RANGE };
       
     pthread_mutex_lock(ps->mutex + MQUEUE);
     TAILQ_INSERT_TAIL(ps->headp, n1, entries);
     pthread_mutex_unlock(ps->mutex + MQUEUE);
 
-    /*
-    dfprintf(stderr, "%s: Generated workpack %ld with range %ld %ld for generation %ld\n", __FUNCTION__, n1->work.packno, n1->work.particle_start, n1->work.particle_end, n1->work.generationno);
-    */
-    
     ps->prw.workid++;
 
   }
@@ -906,9 +935,9 @@ workunit gen_workcalc(psorw *prw) {
 
 int show_pso(pso *ps) {
 
-  printf("Particles: %ld\n", ps->num_particles);  
-  printf("Generations: %ld\n", ps->num_generations);
-  printf("Threads: %ld\n", ps->num_threads);  
+  fprintf(stderr, "Particles: %ld\n", ps->num_particles);  
+  fprintf(stderr, "Generations: %ld\n", ps->num_generations);
+  fprintf(stderr, "Threads: %ld\n", ps->num_threads);  
 
   return 0;
 
@@ -944,7 +973,7 @@ int show_work(workunit *work) {
   
 }
   
-int show_threads(uint64_t *thread_states, long int num_threads) {
+int show_threads(volatile uint64_t *thread_states, long int num_threads) {
 
   long int threadno;
 
@@ -964,18 +993,22 @@ int set_initial(particlepack *pp, long int num_particles) {
 
   long int particleno;
 
-  for (particleno = 0; particleno < num_particles; particleno++) {
+  fitnesspack *fpack;
 
-    pp->fitness[particleno] = pp->fitness_func(pp->xcur + particleno, pp->ff_extra);
-    
-    pp->pbest[particleno] = pp->xcur[particleno];
-      
-  }
+  fpack = &(pp->fpack);
   
   pp->gbest = pp->xcur[0];
-  pp->gbesterr = pp->fitness_func(&(pp->gbest), pp->ff_extra);
+  pp->gbesterr = fpack->fitness_func(&(pp->gbest), fpack->ff_extra);
   
   for (particleno = 0; particleno < num_particles; particleno++) {
+
+    pp->pbest[particleno] = pp->xcur[particleno];
+
+    pp->fitness[particleno] = fpack->fitness_func(pp->xcur + particleno, fpack->ff_extra);
+    
+  }
+    
+  for (particleno = 1; particleno < num_particles; particleno++) {
 
     if (pp->fitness[particleno] < pp->gbesterr) {
 
@@ -990,7 +1023,7 @@ int set_initial(particlepack *pp, long int num_particles) {
 
 }
 
-int waitnextgen_total(uint64_t *thread_states, long int num_threads) {
+int waitnextgen_total(volatile uint64_t *thread_states, long int num_threads) {
 
   long int threadno;
 
@@ -1012,7 +1045,7 @@ enum { CALCCHECK = 1, PACKFILLED, ENSUREWAIT, GENWORK, CALCULATE, ADVANCE };
 
 enum { MP_NONE, MP_CONTINUE, MP_SHUTDOWN };
 
-int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long int *mainproc) {
+int mp_monitor(pso *ps, particlepack *pp, threadpack *tps, extraparams *ep, long int *mainproc) {
 
   long int threadno;
 
@@ -1060,19 +1093,25 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 
       long int packno;
 
-      pthread_mutex_lock(ps->mutex + MPACK);
+      pthread_mutex_lock(ps->mutex + MGENERATION);
       for (packno = 0; packno < ps->workpacks_pergeneration; packno++) {
 	if (!(ps->wp.wpstatus[packno])) {
 	  packscan_counter++;
 	  break;
 	}
       }
-      pthread_mutex_unlock(ps->mutex + MPACK);
+      pthread_mutex_unlock(ps->mutex + MGENERATION);
 
       if (packno < ps->workpacks_pergeneration) {
 
 	dfprintf(stderr, "%s(%gs): Still don't have pack filled for generationno %ld\n", __FUNCTION__, elap_cur(&(ps->start), ep), ps->prw.generationno);      
 
+#ifdef debugprint
+	pthread_mutex_lock(ps->mutex + MGENERATION);
+	show_wpstatus(&(ps->wp), ps->workpacks_pergeneration);
+	pthread_mutex_unlock(ps->mutex + MGENERATION);
+#endif
+	
 	for (threadno = 0; threadno < (ps->num_threads - 1); threadno++) {
 
 	  if (ps->prw.thread_states[threadno] == (RUNNING | HAVEWORK)) {
@@ -1094,7 +1133,7 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 	  pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
 	  show_threads(ps->prw.thread_states, ps->num_threads);
 	  pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
-      
+
 	  return MP_CONTINUE;
 	    
 	}
@@ -1123,28 +1162,24 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 
     incomplete = 0;
     
+    pthread_mutex_lock(ps->mutex + MTHREADSTATE);
     for (threadno = 0; threadno < (ps->num_threads - 1); threadno++) {
 
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
       if (!(ps->prw.thread_states[threadno] & WAITCOND_NEXTGEN)) {
 	incomplete |= 1;
       }
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      
 
     }
-
+    pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
+    
     if (incomplete) {
 
       dfprintf(stderr, "%s(%gs): ENSUREWAIT Still waiting for all threads to become WAITCOND_NEXTGEN.\n", __FUNCTION__, elap_cur(&(ps->start), ep));
 
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
-      show_threads(ps->prw.thread_states, ps->num_threads);
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
-      
       return MP_CONTINUE;
 	
     }
-      
+
     mainproc[0] = GENWORK;
       
   }
@@ -1165,27 +1200,39 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 
     dfprintf(stderr, "%s(%gs): CALCULATE\n", __FUNCTION__, elap_cur(&(ps->start), ep));
 
-    pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
-    show_threads(ps->prw.thread_states, ps->num_threads);
-    pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      
-      
-    retval = process_calcwork(ps, tp, &(ps->recalc));
+    retval = process_calcwork(ps, ep, &(ps->pp.fpack), &(ps->recalc));
     if (retval == -1) {
 
-      fprintf(stderr, "%s[%ld]: Failure with call to process_calcwork.\n", __FUNCTION__, tp->threadno);
+      fprintf(stderr, "%s: Failure with call to process_calcwork.\n", __FUNCTION__);
 
       pthread_mutex_lock(ps->mutex + MTHREADSTATE);
-      shutdown_threads(tp->thread_states, ps->num_threads);
+      shutdown_threads(ps->prw.thread_states, ps->num_threads);
       pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
 	
       pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
-      show_threads(tp->thread_states, ps->num_threads);
+      show_threads(ps->prw.thread_states, ps->num_threads);
       pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      
 	
       return MP_SHUTDOWN;
 
     }
-      
+
+#ifdef debugprint
+    {
+      long int particleno;
+      for (particleno = 0; particleno < 5; particleno++) {
+	fprintf(stderr, "%s: Particle %ld value %g %g %g\n", __FUNCTION__, particleno, pp->pbest[particleno].x, pp->pbest[particleno].y, pp->pbest[particleno].z);
+      }
+    }
+#endif
+
+    ps->prw.gencompleted_counter++;
+
+    if (ps->max_generations && ps->max_generations >= ps->prw.gencompleted_counter) {
+      fprintf(stderr, "%s: Stopping after %ld max_generations.\n", __FUNCTION__, ps->max_generations);
+      return MP_SHUTDOWN;
+    }
+    
     mainproc[0] = ADVANCE;
 
   }
@@ -1212,9 +1259,6 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 
       dfprintf(stderr, "%s: Not all of the threads have made it to the EMPTYQUEUE waiting position.\n", __FUNCTION__);
 
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
-      show_threads(ps->prw.thread_states, ps->num_threads);
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);
       
       return MP_CONTINUE;
 	
@@ -1238,19 +1282,28 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
 
       fprintf(stderr, "%s: Not all of the threads have made it to nextgen waiting condition.\n", __FUNCTION__);
 
-      pthread_mutex_lock(ps->mutex + MTHREADSTATE);      
-      show_threads(ps->prw.thread_states, ps->num_threads);
-      pthread_mutex_unlock(ps->mutex + MTHREADSTATE);      	
 
       return MP_CONTINUE;
 
     }
       
     {
-	
-      retval = advance_generation(ps, pp, ps->workpacks_pergeneration);
+
+      long int bestno;
+
+      pthread_mutex_lock(ps->mutex + MGLOBALBEST);
+      for (bestno = 0; bestno < ps->num_threads; bestno++) {
+
+	if (tps[bestno].tp_gbest.besterr < pp->gbesterr) {
+	  pp->gbest = tps[bestno].tp_gbest.best;
+	  pp->gbesterr = tps[bestno].tp_gbest.besterr;	  
+	}
+      }
+      pthread_mutex_unlock(ps->mutex + MGLOBALBEST);
+      
+      retval = advance_generation(ps, pp, ps->workpacks_pergeneration, ps->packs_region);
       if (retval == -1) {
-	printf("%s[%ld]: Trouble with call to advance_generation.\n", __FUNCTION__, tp->threadno);
+	printf("%s: Trouble with call to advance_generation.\n", __FUNCTION__);
 	return -1;
       }
 
@@ -1275,7 +1328,19 @@ int mp_monitor(pso *ps, particlepack *pp, threadpack *tp, extraparams *ep, long 
   return MP_NONE;
 
 }
+
+update_param tuning_param(double accel_c, double c1, double c2) {
+
+  update_param up;
+
+  up.accel_c = accel_c;
+  up.c1 = c1;
+  up.c2 = c2;
+
+  return up;
   
+}
+
 int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), void *ff_extra) {
 
   long int threadno;
@@ -1351,7 +1416,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
   
   retval = fill_initialrnd(pp, ps->num_particles, rnd_fd, ps->blo, ps->bup);
   if (retval == -1) {
-    printf("%s: Trouble with call to fill_initialrnd.\n", __FUNCTION__);
+    fprintf(stderr, "%s: Trouble with call to fill_initialrnd.\n", __FUNCTION__);
     return -1;
   }
 
@@ -1363,9 +1428,9 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 
     ps->prw.generationno = 0;
 
-    retval = generate_work(ps, ps->workpacks_pergeneration, ps->prw.generationno);
+    retval = generate_work(ps, ps->workpacks_pergeneration, ps->prw.generationno, ps->packs_region);
     if (retval == -1) {
-      printf("%s: Trouble with call to generate_work.\n", __FUNCTION__);
+      fprintf(stderr, "%s: Trouble with call to generate_work.\n", __FUNCTION__);
       return -1;
     }
 
@@ -1373,11 +1438,15 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
   
   for (threadno = 0; threadno < ps->num_threads; threadno++) {
 
+    particlepack *pp;
+
+    pp = &(ps->pp);
+    
     tps[threadno].state = ps->prw.thread_states + threadno;
     
     tps[threadno].state[0] = RUNNING;
     tps[threadno].ps = ps;
-    tps[threadno].pp = &(ps->pp);
+    tps[threadno].pp = pp;
     tps[threadno].threadno = threadno;
     tps[threadno].rnd_fd = rnd_fd;
     tps[threadno].fitness_func = fitness_func;
@@ -1387,13 +1456,18 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
     
     tps[threadno].ep = &ep;
 
+    tps[threadno].tp_gbest.best = pp->gbest;
+    tps[threadno].tp_gbest.besterr = pp->gbesterr;
+    
     tps[threadno].thread_states = ps->prw.thread_states;
 
     tps[threadno].generationno = &(ps->prw.generationno);
 
   }
 
-  clear_wpstatus(&(ps->wp), pso_workpacks);
+  pthread_mutex_lock(ps->mutex + MPACK);
+  clear_wpstatus(&(ps->wp), ps->workpacks_pergeneration);
+  pthread_mutex_unlock(ps->mutex + MPACK);
   
   for (threadno = 0; threadno < (ps->num_threads - 1); threadno++) {
 
@@ -1405,7 +1479,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 
   enum { MAINPROC_WORK = 0x1 };
 
-  mainstate = MAINPROC_WORK;
+  mainstate = 0;
   
   mainproc = PACKFILLED;
 
@@ -1427,7 +1501,9 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
   
   for (;;) {
 
+    pthread_mutex_lock(ps->mutex + MGENERATION);
     dfprintf(stderr, "%s[%ld]: generationno %ld tp->state %lu mainproc %ld\n", __FUNCTION__, counter, ps->prw.generationno, tp->state[0], mainproc);
+    pthread_mutex_unlock(ps->mutex + MGENERATION);
     
     counter++;
     
@@ -1449,13 +1525,9 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 	    n2 = TAILQ_FIRST(ps->headp);
 	    work = n2->work;
 	    TAILQ_REMOVE(ps->headp, n2, entries);
-	    pthread_mutex_lock(ps->mutex + MTHREADSTATE);	
 	    tp->state[0] |= HAVEWORK;
-	    pthread_mutex_unlock(ps->mutex + MTHREADSTATE);	
 	  } else {
-	    pthread_mutex_lock(ps->mutex + MTHREADSTATE);	
 	    tp->state[0] |= EMPTYQUEUE;
-	    pthread_mutex_unlock(ps->mutex + MTHREADSTATE);	
 	  }
 	  pthread_mutex_unlock(ps->mutex + MQUEUE);
 
@@ -1467,13 +1539,11 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 	
 	  retval = process_regwork(ps, tp, &work);
 	  if (retval == -1) {
-	    printf("%s: Failure with call to process_regwork.\n", __FUNCTION__);
+	    fprintf(stderr, "%s: Failure with call to process_regwork.\n", __FUNCTION__);
 	    break;
 	  }
 
-	  pthread_mutex_lock(ps->mutex + MTHREADSTATE);	
 	  tp->state[0] &= (~HAVEWORK);
-	  pthread_mutex_unlock(ps->mutex + MTHREADSTATE);	
 	
 	  wcounter++;
 
@@ -1485,9 +1555,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 	
       if ( (tp->state[0] & EMPTYQUEUE) && (tp->state[0] & RUNNING) ) {
 
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);	
 	tp->state[0] |= WAITCOND_NEXTGEN;
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);	
 	
 	break;
 	
@@ -1495,9 +1563,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
       
       if ( (tp->state[0] & WAITCOND_NEXTGEN) && (tp->state[0] & RUNNING) ) {
 
-	pthread_mutex_lock(ps->mutex + MTHREADSTATE);
 	tp->state[0] &= ~(EMPTYQUEUE);
-	pthread_mutex_unlock(ps->mutex + MTHREADSTATE);	
 	
 	break;
 	
@@ -1517,7 +1583,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
       break;
     }
 
-    retval = mp_monitor(ps, pp, tp, &ep, &mainproc);
+    retval = mp_monitor(ps, pp, tps, &ep, &mainproc);
     switch(retval) {
     case MP_NONE: break;
     case MP_CONTINUE:
@@ -1539,6 +1605,30 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
     
   }
 
+  fprintf(stderr, "%s: Completed %lu generations.\n", __FUNCTION__, ps->prw.gencompleted_counter);
+
+  {
+
+    long int incomplete;
+
+    do {
+
+      incomplete = 0;
+
+      dfprintf(stderr, "%s: Still waiting for threads to stop.\n", __FUNCTION__);
+      
+      for (threadno = 0; threadno < (ps->num_threads - 1); threadno++) {
+
+	if (ps->prw.thread_states[threadno] && !(ps->prw.thread_states[threadno] & WAITCOND_NEXTGEN)) {
+	  incomplete |= 1;
+	}
+
+      }
+
+    } while (incomplete);
+
+  }
+  
   {
 
     dfprintf(stderr, "%s: Final total error calculation.\n", __FUNCTION__);
@@ -1547,7 +1637,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
     ps->recalc = gen_workcalc(&(ps->prw));
     pthread_mutex_unlock(ps->mutex + MGENERATION);
   
-    retval = process_calcwork(ps, tp, &(ps->recalc));
+    retval = process_calcwork(ps, &ep, &(pp->fpack), &(ps->recalc));
     if (retval == -1) {
 
       fprintf(stderr, "%s[%ld]: Failure with call to process_calcwork.\n", __FUNCTION__, tp->threadno);
@@ -1582,7 +1672,7 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 
     elapsed = (ep.now.tv_sec - ps->start.tv_sec);
 
-    printf("Elapsed runtime %gs\n", elapsed);
+    fprintf(stderr, "Elapsed runtime %.4gs\n", elapsed);
 
   }
   
@@ -1601,11 +1691,11 @@ int process_pso(pso *ps, double (*fitness_func)(point3d_t *pnta, void *extra), v
 
 int close_pso(pso *ps) {
 
-  int retval;
-
   long int threadno;
 
   long int mutexno;
+
+  int retval;
   
   free(ps->pp.vcur);
   free(ps->pp.xcur);
@@ -1614,28 +1704,18 @@ int close_pso(pso *ps) {
   free(ps->pp.pbest);
 
   free(ps->gr.threadprogress_totalerrs);
-
+  free(ps->wp.wpstatus);
+  
   for (mutexno = 0; mutexno < num_mutex; mutexno++) {
     retval = pthread_mutex_destroy(ps->mutex + mutexno);
+    if (retval == -1) {
+      perror("pthread_mutex_destroy");
+      return -1;
+    }
   }
 
   free(ps->mutex);
   
-  retval = pthread_cond_destroy(&(ps->worker_calccond));
-
-  for (threadno = 0; threadno < ps->num_threads; threadno++) {
-
-    retval = pthread_mutex_destroy(ps->worker_calc + threadno);  
-
-  }
-  
-  retval = pthread_cond_destroy(&(ps->mainproc_cond));
-  retval = pthread_mutex_destroy(&(ps->mainproc_mutex));  
-  if (retval == -1) {
-    perror("pthread_mutex_destroy");
-    return -1;
-  }
-
   retval = pthread_cond_destroy(&(ps->worker_advancecond));
   
   for (threadno = 0; threadno < ps->num_threads; threadno++) {
@@ -1644,8 +1724,6 @@ int close_pso(pso *ps) {
 
   }
 
-  free(ps->worker_calc);
-  
   free(ps->worker_advance);
   
   free(ps->prw.thread_states);
@@ -1653,7 +1731,16 @@ int close_pso(pso *ps) {
   return 0;
     
 }
-  
+
+int setfull_computation(long int *packs_region, long int workpacks_pergeneration) {
+
+  packs_region[0] = 0;
+  packs_region[1] = workpacks_pergeneration;
+
+  return 0;
+
+}
+
 int debug_frame(particlepack *pp, long int num_particles) {
 
   long int particleno;
